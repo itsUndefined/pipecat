@@ -90,7 +90,11 @@ class EvalScriptSession(EvalSession[EvalScriptResult]):
         super().__init__(kind=EvalKind.SCRIPT, name=scenario.name, bot_url=bot_url, params=params)
         self._scenario = scenario
         # The bot's output as events: fed by the client's pipeline, read by the driver.
-        self._stream = EvalEventStream(bot_audio=scenario.bot_audio, trace=self._trace)
+        self._stream = EvalEventStream(
+            bot_audio=scenario.bot_audio,
+            trace=self._trace,
+            wait_for_reply=scenario.wait_for_reply,
+        )
         # The connection to the bot: the eval pipeline and the user's sends,
         # asking the bot for what the scenario's assertions need.
         self._client = EvalClient(

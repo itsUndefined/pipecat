@@ -79,10 +79,21 @@ from typing import Any
 
 from pipecat.evals.results import EvalTrace
 from pipecat.evals.serializer import EVAL_BOT_IMAGE_TYPE
+from pipecat.transports.base_output import BOT_VAD_STOP_SECS
 
 # The bot's reports that end its current turn: what it produced so far is not
 # its reply to what comes next.
 _INTERRUPTION_EVENTS = ("user_started_speaking", "bot_interrupted")
+
+# How long a bot that does not speak still counts as replying while the LLM
+# response it owes has not started: the one that answers a send, or that takes
+# a function call's result. Either may never come.
+REPLY_START_GRACE_S = 2.0
+# How long after an LLM response ends with no function call open such a bot
+# still counts as replying: lines it sends back to back are one reply, as
+# speech is one turn until the output transport has heard this much silence.
+REPLY_SETTLE_S = BOT_VAD_STOP_SECS
+_REPLY_POLL_S = 0.01
 
 
 class EvalBotEndedError(Exception):
@@ -105,15 +116,18 @@ class EvalEventStream:
     before the send is dropped when it ends.
     """
 
-    def __init__(self, *, bot_audio: bool, trace: EvalTrace):
+    def __init__(self, *, bot_audio: bool, trace: EvalTrace, wait_for_reply: bool = False):
         """Initialize the stream.
 
         Args:
             bot_audio: Whether the scenario runs in audio mode; ``tts_response``
                 is emitted only then.
             trace: The run's trace, where each event is logged as it arrives.
+            wait_for_reply: Whether to follow the reply of a bot that does not
+                speak (see :attr:`bot_replying`). No effect in audio mode.
         """
         self._bot_audio = bot_audio
+        self._follow_reply = wait_for_reply and not bot_audio
         self._trace = trace
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         # The events popped during the current turn, in order, and which of them
@@ -167,6 +181,20 @@ class EvalEventStream:
         # that must not talk over the bot can wait for it without polling.
         self._bot_quiet = asyncio.Event()
         self._bot_quiet.set()
+        # A bot that does not speak (text mode) reports no speaking, so whether
+        # it is still replying is read from its LLM and its function calls: an
+        # LLM response under way, function calls announced or running, and
+        # until when a response it owes may still start.
+        self._llm_responding = False
+        self._calls_announced = 0
+        self._calls_running: list[str | None] = []
+        self._calls_over: set[str] = set()
+        self._call_ended = False
+        self._reply_owed = False
+        self._reply_due_until = 0.0
+        # Whether a reply has been waited for, or has started, since the bot
+        # last had cause to give one: the call starting, or an input.
+        self._reply_awaited = False
         # Whether everything the bot has said is transcribed and closed into a
         # turn (audio mode): a segment of its speech the VAD still hears,
         # segments still to be transcribed, and whether a spoken turn is open.
@@ -188,6 +216,43 @@ class EvalEventStream:
     def bot_speaking(self) -> bool:
         """Whether the bot reports itself speaking right now."""
         return not self._bot_quiet.is_set()
+
+    @property
+    def bot_replying(self) -> bool:
+        """Whether a bot that does not speak is still working on its reply (text mode, with ``wait_for_reply``).
+
+        It is from the user's send until ``REPLY_SETTLE_S`` after an LLM
+        response ends with no function call announced or running, the response
+        that takes a call's result included, and no other response starts. A
+        response it owes that does not start within
+        ``REPLY_START_GRACE_S`` is not waited for. A bot that speaks is never
+        replying in this sense: :attr:`bot_speaking` says when it is done.
+        """
+        if self._bot_ended or self._harness_error is not None:
+            return False
+        return (
+            self._llm_responding
+            or self._calls_announced > 0
+            or bool(self._calls_running)
+            or time.monotonic() < self._reply_due_until
+        )
+
+    async def wait_bot_replied(self, timeout: float) -> bool:
+        """Wait for a bot that does not speak to finish its reply (text mode).
+
+        Args:
+            timeout: Seconds to wait at most.
+
+        Returns:
+            Whether the reply is over, or False if the bot was still replying
+            at the timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while self.bot_replying:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_REPLY_POLL_S)
+        return True
 
     @property
     def talked_over_until(self) -> float | None:
@@ -472,6 +537,8 @@ class EvalEventStream:
             The event the message maps to, or ``None``; many map to none.
         """
         self.touch()
+        if self._follow_reply:
+            self._track_reply(message)
         event = self._event_for_rtvi_message(message)
         if event is None:
             return None
@@ -508,9 +575,32 @@ class EvalEventStream:
             return
         await self.append({"type": "response", "text": text})
 
-    def input_sent(self) -> None:
-        """Mark the user's input as sent: the bot's reply is what it says from now on."""
+    def input_sent(self, *, reply_due: bool = True) -> None:
+        """Mark the user's input as sent: the bot's reply is what it says from now on.
+
+        Args:
+            reply_due: Whether the input is one the bot answers, so that a bot
+                that does not speak counts as replying from now on (see
+                :attr:`bot_replying`). Not so for keypresses, which a bot
+                gathers before it answers.
+        """
         self.turn_boundary()
+        self._reply_owed = reply_due and self._follow_reply
+        self._reply_awaited = self._reply_owed
+        # A response owed to the input before this one is owed no more.
+        self._reply_due_until = time.monotonic() + REPLY_START_GRACE_S if self._reply_owed else 0.0
+
+    def expect_reply(self) -> None:
+        """Count a bot that does not speak as replying to a turn that sends nothing.
+
+        What the bot says next is the turn's, so a response is waited for as
+        after a send (see :attr:`bot_replying`), unless one has started, or was
+        waited for, since the last input.
+        """
+        if not self._follow_reply or self._reply_awaited:
+            return
+        self._reply_awaited = True
+        self._reply_due_until = time.monotonic() + REPLY_START_GRACE_S
 
     def turn_boundary(self) -> None:
         """Start a new turn: only what the bot says from now on belongs to it.
@@ -556,6 +646,66 @@ class EvalEventStream:
         self._text_buffer = []
         self._awaiting_reply = True
         self._bot_quiet.set()
+        self._llm_responding = False
+        if self._reply_owed:
+            # The send that cut the response off is still to be answered.
+            self._reply_due_until = time.monotonic() + REPLY_START_GRACE_S
+
+    def _track_reply(self, message: Any) -> None:
+        """Follow the LLM responses and function calls a bot that does not speak replies with."""
+        msg_type = message.get("type") if isinstance(message, dict) else None
+        if msg_type == "bot-llm-started":
+            # Not counted: a service may report one response as started twice.
+            self._llm_responding = True
+            self._call_ended = False
+            self._reply_awaited = True
+            self._reply_due_until = 0.0
+            return
+        elif msg_type == "bot-llm-stopped":
+            self._llm_responding = False
+        elif msg_type == "llm-function-call-started":
+            # A call is announced before the response that makes it ends, and
+            # may only start running after it.
+            self._calls_announced += 1
+            return
+        elif msg_type == "llm-function-call-in-progress":
+            call_id = self._tool_call_id(message)
+            if call_id is None or not (
+                call_id in self._calls_running or call_id in self._calls_over
+            ):
+                self._calls_announced = max(0, self._calls_announced - 1)
+                self._calls_running.append(call_id)
+            return
+        elif msg_type == "llm-function-call-stopped":
+            # A call's end may be reported more than once, and must not end
+            # another call.
+            call_id = self._tool_call_id(message)
+            if call_id is not None and call_id in self._calls_over:
+                return
+            if call_id in self._calls_running:
+                self._calls_running.remove(call_id)
+            else:
+                self._calls_announced = max(0, self._calls_announced - 1)
+            if call_id is not None:
+                self._calls_over.add(call_id)
+            self._call_ended = True
+        else:
+            return
+        if self._llm_responding or self._calls_announced or self._calls_running:
+            return
+        if self._call_ended:
+            # The response that takes the calls' results starts after the last
+            # of them is reported over.
+            self._call_ended = False
+            self._reply_due_until = time.monotonic() + REPLY_START_GRACE_S
+        else:
+            # Never sooner than a response still owed: the response that ended
+            # may be one a send cut off, not the answer to it.
+            self._reply_due_until = max(self._reply_due_until, time.monotonic() + REPLY_SETTLE_S)
+
+    @staticmethod
+    def _tool_call_id(message: dict) -> str | None:
+        return (message.get("data") or {}).get("tool_call_id") or None
 
     def _event_for_rtvi_message(self, message: Any) -> dict | None:
         """Map one of the bot's reports, about its own output or about the harness, to its event, if any."""

@@ -107,14 +107,15 @@ def _rtvi(msg_type: str, data: dict | None = None) -> str:
     return json.dumps({"label": RTVI.MESSAGE_LABEL, "type": msg_type, "data": data})
 
 
-def _session(bot_audio: bool = False) -> EvalScriptSession:
+def _session(bot_audio: bool = False, wait_for_reply: bool = False) -> EvalScriptSession:
     return EvalScriptSession(
-        EvalScriptScenario(name="t", turns=[], bot_audio=bot_audio), "ws://localhost:0"
+        EvalScriptScenario(name="t", turns=[], bot_audio=bot_audio, wait_for_reply=wait_for_reply),
+        "ws://localhost:0",
     )
 
 
-def _stream(bot_audio: bool = False) -> EvalEventStream:
-    return EvalEventStream(bot_audio=bot_audio, trace=EvalTrace())
+def _stream(bot_audio: bool = False, wait_for_reply: bool = False) -> EvalEventStream:
+    return EvalEventStream(bot_audio=bot_audio, trace=EvalTrace(), wait_for_reply=wait_for_reply)
 
 
 def _bot_message(msg_type: str, data: dict | None = None) -> dict:
@@ -639,6 +640,307 @@ class TestSendWaitsForTheBot(unittest.IsolatedAsyncioTestCase):
         started = asyncio.get_running_loop().time()
         await session._driver._await_bot_quiet()
         self.assertLess(asyncio.get_running_loop().time() - started, 0.05)
+
+
+class _BotThatRepliesLater:
+    """A text-mode client whose bot reports its reply to each line a moment after it is sent."""
+
+    has_user_tts = False
+
+    def __init__(self, stream: EvalEventStream, reply: list[str], every_s: float = 0.03):
+        self._stream = stream
+        self._reply = reply
+        self._every_s = every_s
+        self.sent_at: list[float] = []
+        self.replied_at: list[float] = []
+        self._tasks: list[asyncio.Task] = []
+
+    async def send_text(self, text: str):
+        self.sent_at.append(time.monotonic())
+        self._tasks.append(asyncio.create_task(self._answer()))
+
+    async def send_dtmf(self, keys: str):
+        await self.send_text(keys)
+
+    def greet(self):
+        """Have the bot say its reply unprompted, a moment from now."""
+        self._tasks.append(asyncio.create_task(self._answer()))
+
+    async def _answer(self):
+        for msg_type in self._reply:
+            await asyncio.sleep(self._every_s)
+            event = self._stream.rtvi_message_to_event(_bot_message(msg_type))
+            if event is not None:
+                await self._stream.append(event)
+        self.replied_at.append(time.monotonic())
+
+    async def finish(self):
+        await asyncio.gather(*self._tasks)
+
+
+class TestTextSendWaitsForTheReply(unittest.IsolatedAsyncioTestCase):
+    """With ``wait_for_reply``, a bot that does not speak is waited for until its LLM and its function calls are done."""
+
+    TOOL_REPLY = [
+        "bot-llm-started",
+        "llm-function-call-started",
+        "bot-llm-stopped",
+        "llm-function-call-in-progress",
+        "llm-function-call-stopped",
+        "bot-llm-started",
+        "bot-llm-stopped",
+    ]
+
+    async def _send_two_turns(
+        self, reply: list[str], first: EvalScriptTurn | None = None
+    ) -> _BotThatRepliesLater:
+        client = await self._run_turns(
+            reply, [first or EvalScriptTurn(user="one"), EvalScriptTurn(user="two")]
+        )
+        self.assertEqual(self.failures, [])
+        return client
+
+    async def _run_turns(
+        self,
+        reply: list[str],
+        turns: list[EvalScriptTurn],
+        greets: bool = False,
+        wait_for_reply: bool = True,
+        every_s: float = 0.03,
+    ) -> _BotThatRepliesLater:
+        async def on_progress(_):
+            pass
+
+        stream = _stream(wait_for_reply=wait_for_reply)
+        client = _BotThatRepliesLater(stream, reply, every_s)
+        if greets:
+            client.greet()
+        driver = EvalScriptDriver(
+            scenario=EvalScriptScenario(name="t", turns=turns),
+            default_timeout_ms=5000,
+            client=client,  # type: ignore[arg-type]
+            stream=stream,
+            judge=None,
+            trace=EvalTrace(),
+            progress=on_progress,
+        )
+        self.failures = await driver.run()
+        self.ran_until = time.monotonic()
+        await client.finish()
+        return client
+
+    TWO_LINES = ["bot-llm-started", "bot-llm-stopped", "bot-llm-started", "bot-llm-stopped"]
+
+    async def test_a_first_turn_that_sends_nothing_holds_the_send_for_the_greeting(self):
+        client = await self._run_turns(
+            self.TWO_LINES, [EvalScriptTurn(user=None), EvalScriptTurn(user="one")], greets=True
+        )
+        self.assertGreaterEqual(client.sent_at[0], client.replied_at[0])
+
+    async def test_a_greeting_already_over_costs_a_turn_that_sends_nothing_no_wait(self):
+        stream = _stream(wait_for_reply=True)
+        for msg_type in self.TWO_LINES:
+            stream.rtvi_message_to_event(_bot_message(msg_type))
+        await stream.wait_bot_replied(1)
+        stream.expect_reply()
+        self.assertFalse(stream.bot_replying)
+
+    async def test_the_run_ends_once_the_reply_to_the_last_turn_is_over(self):
+        for last_turns in (
+            [EvalScriptTurn(user="one")],
+            [EvalScriptTurn(user="one"), EvalScriptTurn(user=None)],
+            [EvalScriptTurn(user=None, dtmf="1#"), EvalScriptTurn(user=None)],
+        ):
+            client = await self._run_turns(["bot-llm-started", "bot-llm-stopped"], last_turns)
+            self.assertGreaterEqual(self.ran_until, client.replied_at[0], last_turns)
+
+    async def test_a_turn_that_sends_nothing_starts_its_clock_at_once(self):
+        late = EvalExpectation(event="llm_response", within_ms=50)
+        await self._run_turns(
+            ["bot-llm-started", "bot-llm-stopped"],
+            [EvalScriptTurn(user="one"), EvalScriptTurn(user=None, expect=[late])],
+            every_s=0.07,
+        )
+        self.assertEqual([failure.kind for failure in self.failures], ["timeout"])
+
+    async def test_nothing_is_waited_for_unless_the_scenario_asks(self):
+        client = await self._run_turns(
+            ["bot-llm-started", "bot-llm-stopped"],
+            [EvalScriptTurn(user="one"), EvalScriptTurn(user="two")],
+            wait_for_reply=False,
+        )
+        self.assertLess(client.sent_at[1], client.replied_at[0])
+        self.assertLess(self.ran_until, client.replied_at[1])
+
+    async def test_a_turn_expecting_nothing_still_lets_the_bot_reply(self):
+        client = await self._send_two_turns(["bot-llm-started", "bot-llm-stopped"])
+        self.assertGreaterEqual(client.sent_at[1], client.replied_at[0])
+
+    async def test_the_reply_goes_on_through_a_function_call(self):
+        client = await self._send_two_turns(self.TOOL_REPLY)
+        self.assertGreaterEqual(client.sent_at[1], client.replied_at[0])
+
+    async def test_lines_the_bot_sends_back_to_back_are_one_reply(self):
+        client = await self._send_two_turns(
+            ["bot-llm-started", "bot-llm-stopped", "bot-llm-started", "bot-llm-stopped"]
+        )
+        self.assertGreaterEqual(client.sent_at[1], client.replied_at[0])
+
+    async def test_the_reply_is_over_once_no_other_response_follows(self):
+        from pipecat.evals import events as events_module
+
+        stream = _stream(wait_for_reply=True)
+        with patch.object(events_module, "REPLY_SETTLE_S", 0.1):
+            for msg_type in ("bot-llm-started", "bot-llm-stopped"):
+                stream.rtvi_message_to_event(_bot_message(msg_type))
+            self.assertTrue(stream.bot_replying)
+            started = time.monotonic()
+            self.assertTrue(await stream.wait_bot_replied(5))
+        self.assertGreaterEqual(time.monotonic() - started, 0.09)
+        self.assertLess(time.monotonic() - started, 1)
+
+    async def test_a_response_cut_off_by_the_send_does_not_end_the_wait_for_its_answer(self):
+        from pipecat.evals import events as events_module
+
+        stream = _stream(wait_for_reply=True)
+        with patch.object(events_module, "REPLY_SETTLE_S", 0.05):
+            stream.rtvi_message_to_event(_bot_message("bot-llm-started"))
+            stream.input_sent()
+            stream.rtvi_message_to_event(_bot_message("bot-llm-stopped"))
+            await asyncio.sleep(0.1)
+        self.assertTrue(stream.bot_replying)
+
+    async def test_a_response_reported_as_started_twice_ends_once(self):
+        from pipecat.evals import events as events_module
+
+        stream = _stream(wait_for_reply=True)
+        with patch.object(events_module, "REPLY_SETTLE_S", 0.05):
+            for msg_type in ("bot-llm-started", "bot-llm-started", "bot-llm-stopped"):
+                stream.rtvi_message_to_event(_bot_message(msg_type))
+            self.assertTrue(await stream.wait_bot_replied(1))
+
+    async def test_a_response_the_send_interrupts_does_not_pass_for_its_answer(self):
+        stream = _stream(wait_for_reply=True)
+        stream.input_sent()
+        for msg_type in ("bot-llm-started", "bot-interrupted"):
+            stream.rtvi_message_to_event(_bot_message(msg_type))
+        self.assertTrue(stream.bot_replying)
+
+    async def test_a_call_announced_after_its_response_ended_keeps_the_reply_open(self):
+        from pipecat.evals import events as events_module
+
+        stream = _stream(wait_for_reply=True)
+        with patch.object(events_module, "REPLY_SETTLE_S", 0.05):
+            for msg_type in (
+                "bot-llm-started",
+                "bot-llm-stopped",
+                "llm-function-call-started",
+                "llm-function-call-in-progress",
+                "llm-function-call-stopped",
+            ):
+                stream.rtvi_message_to_event(_bot_message(msg_type))
+            await asyncio.sleep(0.1)
+            self.assertTrue(stream.bot_replying)
+            for msg_type in ("bot-llm-started", "bot-llm-stopped"):
+                stream.rtvi_message_to_event(_bot_message(msg_type))
+            self.assertTrue(await stream.wait_bot_replied(1))
+
+    async def test_keypresses_are_not_waited_for_even_when_they_interrupt(self):
+        client = await self._send_two_turns(
+            ["bot-interrupted", "bot-llm-started", "bot-llm-stopped"],
+            first=EvalScriptTurn(user=None, dtmf="1#"),
+        )
+        self.assertLess(client.sent_at[1], client.replied_at[0])
+
+    async def test_keypresses_end_the_wait_for_the_turn_they_cut_in_on(self):
+        stream = _stream(wait_for_reply=True)
+        stream.input_sent()
+        stream.rtvi_message_to_event(
+            _bot_message("llm-function-call-in-progress", {"tool_call_id": "a"})
+        )
+        stream.input_sent(reply_due=False)
+        self.assertTrue(stream.bot_replying)
+        stream.rtvi_message_to_event(
+            _bot_message("llm-function-call-stopped", {"tool_call_id": "a"})
+        )
+        stream.input_sent(reply_due=False)
+        self.assertFalse(stream.bot_replying)
+
+    async def test_a_call_reported_over_twice_ends_no_other_call(self):
+        from pipecat.evals import events as events_module
+
+        def report(stream: EvalEventStream, msg_type: str, call_id: str | None = None):
+            data = {"tool_call_id": call_id} if call_id else None
+            stream.rtvi_message_to_event(_bot_message(msg_type, data))
+
+        stream = _stream(wait_for_reply=True)
+        with patch.object(events_module, "REPLY_START_GRACE_S", 0):
+            report(stream, "bot-llm-started")
+            report(stream, "llm-function-call-started")
+            report(stream, "llm-function-call-started")
+            report(stream, "bot-llm-stopped")
+            report(stream, "llm-function-call-in-progress", "a")
+            report(stream, "llm-function-call-stopped", "a")
+            report(stream, "llm-function-call-stopped", "a")
+            self.assertTrue(stream.bot_replying)
+            report(stream, "llm-function-call-in-progress", "b")
+            report(stream, "llm-function-call-stopped", "a")
+            self.assertTrue(stream.bot_replying)
+            report(stream, "llm-function-call-stopped", "b")
+            self.assertFalse(stream.bot_replying)
+
+    async def test_a_harness_error_ends_the_wait(self):
+        stream = _stream(wait_for_reply=True)
+        stream.rtvi_message_to_event(_bot_message("bot-llm-started"))
+        self.assertTrue(stream.bot_replying)
+        stream.harness_failed("boom")
+        self.assertFalse(stream.bot_replying)
+
+    async def test_a_call_reported_only_once_running_is_waited_for(self):
+        stream = _stream(wait_for_reply=True)
+        for msg_type in ("bot-llm-started", "llm-function-call-in-progress", "bot-llm-stopped"):
+            stream.rtvi_message_to_event(_bot_message(msg_type))
+        self.assertTrue(stream.bot_replying)
+
+    async def test_a_response_that_never_starts_is_given_up_on(self):
+        from pipecat.evals import events as events_module
+
+        with patch.object(events_module, "REPLY_START_GRACE_S", 0.1):
+            for owed_after in ("a send", "a function call"):
+                stream = _stream(wait_for_reply=True)
+                if owed_after == "a send":
+                    stream.input_sent()
+                else:
+                    for msg_type in self.TOOL_REPLY[:5]:
+                        stream.rtvi_message_to_event(_bot_message(msg_type))
+                self.assertTrue(stream.bot_replying, owed_after)
+                started = time.monotonic()
+                self.assertTrue(await stream.wait_bot_replied(5), owed_after)
+                self.assertLess(time.monotonic() - started, 1, owed_after)
+
+    async def test_the_send_gives_up_on_a_bot_that_never_finishes(self):
+        from pipecat.evals import script_driver as driver_module
+
+        session = _session(wait_for_reply=True)
+        session._stream.rtvi_message_to_event(_bot_message("bot-llm-started"))
+        started = time.monotonic()
+        with patch.object(driver_module, "BOT_QUIET_MAX_WAIT_S", 0.1):
+            await session._driver._await_bot_quiet()
+        self.assertLess(time.monotonic() - started, 1)
+
+    async def test_keypresses_and_a_bot_that_ended_the_call_hold_nothing_up(self):
+        stream = _stream(wait_for_reply=True)
+        stream.input_sent(reply_due=False)
+        self.assertFalse(stream.bot_replying)
+        stream.rtvi_message_to_event(_bot_message("bot-llm-started"))
+        stream.bot_ended()
+        self.assertFalse(stream.bot_replying)
+
+    async def test_a_bot_that_speaks_is_waited_for_by_its_speech_alone(self):
+        stream = _stream(bot_audio=True, wait_for_reply=True)
+        stream.input_sent()
+        stream.rtvi_message_to_event(_bot_message("bot-llm-started"))
+        self.assertFalse(stream.bot_replying)
 
 
 class TestJudgeNoIsProvisional(unittest.IsolatedAsyncioTestCase):

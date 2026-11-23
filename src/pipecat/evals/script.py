@@ -24,8 +24,8 @@ The harness plays each turn and checks the events the bot emits back, in
 order. A scenario with a ``persona:`` instead of ``turns:`` is the other kind,
 a simulation, where an LLM plays the user (:mod:`pipecat.evals.simulation`).
 The keys below are a scenario's; the file-level ones (``user:``, ``judge:``,
-``context:``, ``stop_on_failure:``) may also sit at the top of the file as
-defaults for every scenario in it.
+``context:``, ``wait_for_reply:``, ``stop_on_failure:``) may also sit at the top
+of the file as defaults for every scenario in it.
 
 Event names are the friendly names the harness maps RTVI server messages onto:
 ``user_started_speaking``, ``user_stopped_speaking``, ``vad_user_started_speaking``,
@@ -287,7 +287,9 @@ idle timeout — into a ``DTMF: ...`` transcription it reacts to.
 
 A turn is sent once the bot has finished speaking, like a caller who waits for
 the end of the sentence, so a reply the previous turn was satisfied with early
-is never talked over. A turn may also include ``send_after:`` to schedule its
+is never talked over. In text modality the bot does not speak, so nothing
+holds a turn back unless the scenario sets ``wait_for_reply:`` (below). A turn
+may also include ``send_after:`` to schedule its
 ``user``/``dtmf`` send
 relative to a prior event (used for interruption / barge-in tests), or
 ``image:`` (a path, relative to the scenario file) to register an image for the
@@ -329,6 +331,25 @@ Top-level optional fields:
     LLM messages the bot's context should start from. When given, the harness
     sends them before driving turns (replacing the bot's context); omit to leave
     the bot's own context untouched.
+
+``wait_for_reply:``
+    whether, in text modality, a turn is sent only once the bot's reply to the
+    turn before is over (default false). The bot does not speak there, so by
+    default turns with no ``expect:`` are sent one after the other at once. Set
+    it true to have a turn with no ``expect:`` still let the bot answer before
+    the next one is sent::
+
+        wait_for_reply: true
+
+    The reply is over when the bot's LLM response has ended with no function
+    call still running, the response that follows a call's result included,
+    and no other response has started for a moment, so lines the bot sends back
+    to back are one reply. A turn with no ``user:`` is owed a reply the same
+    way, so a first turn with no ``user:`` holds the next turn until the
+    greeting is over, and the run does not end before the reply to the last
+    turn is over. A bot whose LLM does not start within 2 seconds of a turn is
+    not waited for, the wait gives up after 30 seconds, and ``dtmf:`` turns
+    and turns with ``send_after:`` do not wait. No effect in audio modality.
 
 ``stop_on_failure:``
     whether the first failed turn ends the scenario (default true). A failure
@@ -698,6 +719,10 @@ class EvalScriptScenario:
                 No replacement. A bot fires ``on_client_disconnected`` whenever
                 the harness disconnects. Will be removed in 2.0.0.
 
+        wait_for_reply: Whether, in text modality, a turn is sent only once the
+            bot's reply to the turn before is over, and the run ends only once
+            the reply to the last turn is (default False). See
+            ``wait_for_reply:`` in the module docstring.
         stop_on_failure: Whether the first failed turn ends the scenario
             (default True). A failed turn leaves the conversation in an unknown
             state, so continuing usually costs one timeout per remaining turn.
@@ -720,6 +745,7 @@ class EvalScriptScenario:
     user_audio: bool = False
     user_speech: dict | None = None
     trigger_disconnect: bool = False
+    wait_for_reply: bool = False
     stop_on_failure: bool = True
     source_path: Path | None = None
 
@@ -848,6 +874,7 @@ def _parse_script(data: dict, path: Path) -> EvalScriptScenario:
         user_audio=user_audio,
         user_speech=user_speech,
         trigger_disconnect=_parse_trigger_disconnect(data, path),
+        wait_for_reply=bool(data.get("wait_for_reply", False)),
         stop_on_failure=bool(data.get("stop_on_failure", True)),
         source_path=path,
     )

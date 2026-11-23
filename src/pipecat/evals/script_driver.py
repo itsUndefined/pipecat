@@ -35,7 +35,9 @@ SEND_AFTER_MAX_WAIT_S = 30.0
 # How long a turn waits for the bot to finish speaking before it is sent. A
 # reply is still spoken after its first sentence satisfied the previous turn;
 # a turn sent over it would have that tail transcribed as its own reply, or
-# discarded together with the answer that followed it in the same breath.
+# discarded together with the answer that followed it in the same breath. A
+# bot that does not speak (text mode) is waited for as long to finish replying,
+# when the scenario asks for that with ``wait_for_reply``.
 BOT_QUIET_MAX_WAIT_S = 30.0
 SEND_AFTER_POLL_S = 0.01
 
@@ -111,7 +113,17 @@ class EvalScriptDriver(BaseEvalDriver[EvalScriptResult]):
                     self._trace.log(f"turn {turn_idx} failed; stopping scenario (stop_on_failure)")
                     break
                 self._trace.log(f"turn {turn_idx} failed; continuing (stop_on_failure: false)")
+        else:
+            await self._await_last_reply()
         return failures
+
+    async def _await_last_reply(self) -> None:
+        """Let a bot that does not speak finish the reply it owes before the run ends (``wait_for_reply``)."""
+        if not self._stream.bot_replying:
+            return
+        self._trace.log("end: waiting for the bot to finish its reply")
+        if not await self._stream.wait_bot_replied(BOT_QUIET_MAX_WAIT_S):
+            self._trace.log(f"end: bot still replying after {BOT_QUIET_MAX_WAIT_S:g}s")
 
     def result(
         self,
@@ -159,8 +171,10 @@ class EvalScriptDriver(BaseEvalDriver[EvalScriptResult]):
             # A caller waits for the bot to finish; a turn that means to talk
             # over it says so with ``send_after``.
             await self._await_bot_quiet()
-        elif turn_idx > 0:
-            await self._await_previous_reply()
+        else:
+            if turn_idx > 0:
+                await self._await_previous_reply()
+            self._stream.expect_reply()
 
         await self._send_turn(turn)
         await self._progress(
@@ -175,7 +189,18 @@ class EvalScriptDriver(BaseEvalDriver[EvalScriptResult]):
         send waits for the last of it to be transcribed and closed into a turn:
         a transcript can land seconds after its audio, and one landing after
         the send would otherwise be taken for the reply.
+
+        With ``wait_for_reply``, a bot that does not speak (text mode) is
+        waited for until its reply is over: its LLM response has ended, no
+        function call is open and no other response has followed at once.
         """
+        if self._stream.bot_replying:
+            self._trace.log("send: waiting for the bot to finish its reply")
+            if not await self._stream.wait_bot_replied(BOT_QUIET_MAX_WAIT_S):
+                self._trace.log(
+                    f"send: bot still replying after {BOT_QUIET_MAX_WAIT_S:g}s, sending"
+                )
+                return
         if self._stream.bot_speaking:
             self._trace.log("send: waiting for the bot to finish speaking")
             if not await self._stream.wait_bot_quiet(BOT_QUIET_MAX_WAIT_S):

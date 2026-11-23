@@ -1115,6 +1115,20 @@ class TestEvalsScenarioParser(unittest.TestCase):
         self.assertTrue(s.user_audio)
         self.assertEqual(s.user_speech, {"service": "kokoro", "voice": "af_heart"})
 
+    def test_wait_for_reply_defaults_false(self):
+        s = _script(_write("name: a\nturns: [{user: hi, expect: [{event: llm_response}]}]\n"))
+        self.assertFalse(s.wait_for_reply)
+
+    def test_wait_for_reply_true(self):
+        s = _script(
+            _write(
+                "name: a\n"
+                "wait_for_reply: true\n"
+                "turns: [{user: hi, expect: [{event: llm_response}]}]\n"
+            )
+        )
+        self.assertTrue(s.wait_for_reply)
+
     def test_stop_on_failure_defaults_true(self):
         s = _script(_write("name: a\nturns: [{user: hi, expect: [{event: llm_response}]}]\n"))
         self.assertTrue(s.stop_on_failure)

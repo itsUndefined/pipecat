@@ -145,4 +145,4 @@ class BaseEvalDriver(ABC, Generic[R]):
         await self._client.send_dtmf(keys)
         if self._judge is not None:
             self._judge.add_user_message(f"(DTMF keypad input: {keys})")
-        self._stream.input_sent()
+        self._stream.input_sent(reply_due=False)
